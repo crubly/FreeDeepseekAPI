@@ -1,27 +1,105 @@
 #!/usr/bin/env node
 /*
-  Opens/reuses a separate Chrome profile for DeepSeek Web login and extracts
+  Opens/reuses a separate Chrome for Testing profile for DeepSeek Web login and extracts
   the minimum auth metadata into deepseek-auth.json.
 
   Usage:
-    CHROME_PATH="/path/to/Chrome" node scripts/deepseek_chrome_auth.js
+    node scripts/deepseek_chrome_auth.js
+    # optional override: CHROME_PATH="/path/to/browser" node scripts/deepseek_chrome_auth.js
+    # optional reuse: DEEPSEEK_REUSE_CHROME=1 DEEPSEEK_KEEP_CHROME_PROFILE=1 node scripts/deepseek_chrome_auth.js
+
+  Default auth starts a clean disposable Chrome for Testing profile and uses
+  --use-mock-keychain to avoid macOS Keychain prompts.
 
   Flow:
     1. Log in at chat.deepseek.com in the opened Chrome profile.
     2. Send one short prompt (for example: ok) so the frontend initializes state.
     3. Return to terminal and press Enter.
 */
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 
 const repoRoot = path.resolve(__dirname, '..');
-const profileDir = process.env.DEEPSEEK_CHROME_PROFILE || path.join(repoRoot, '.chrome-profile-deepseek');
-const port = Number(process.env.DEEPSEEK_CHROME_PORT || 9333);
+const qwenRepoRoot = path.resolve(repoRoot, '..', 'FreeQwenApi');
+const profileDir = process.env.DEEPSEEK_CHROME_PROFILE || path.join(repoRoot, '.chrome-for-testing-profile-deepseek');
+// Use a dedicated default port so an older normal-Chrome auth window on 9333 is not reused.
+const port = Number(process.env.DEEPSEEK_CHROME_PORT || 9334);
 const outPath = process.env.DEEPSEEK_AUTH_PATH || path.join(repoRoot, 'deepseek-auth.json');
-const chromePath = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const url = 'https://chat.deepseek.com/';
+const reuseChrome = /^(1|true|yes|on)$/i.test(process.env.DEEPSEEK_REUSE_CHROME || '');
+const keepProfile = /^(1|true|yes|on)$/i.test(process.env.DEEPSEEK_KEEP_CHROME_PROFILE || '');
+
+function shellPatternSafe(s) {
+  return String(s).replace(/[\\"']/g, '.');
+}
+
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {}
+}
+
+function killExistingTestingChrome() {
+  if (process.platform !== 'darwin') return;
+  const patterns = [
+    `--remote-debugging-port=${port}`,
+    profileDir,
+  ].map(shellPatternSafe);
+  for (const pattern of patterns) {
+    try { execFileSync('/usr/bin/pkill', ['-f', pattern], { stdio: 'ignore' }); } catch {}
+  }
+  sleepSync(800);
+}
+
+function removeProfileSafely(dir) {
+  if (!fs.existsSync(dir)) return;
+  for (let i = 0; i < 5; i++) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 });
+      if (!fs.existsSync(dir)) return;
+    } catch (e) {
+      if (i === 4) {
+        const staleDir = `${dir}.stale-${Date.now()}`;
+        fs.renameSync(dir, staleDir);
+        try { fs.rmSync(staleDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 250 }); } catch {}
+        console.log(`[auth] Old profile was busy; moved it aside: ${staleDir}`);
+        return;
+      }
+    }
+    sleepSync(300);
+  }
+}
+
+function resolveChromePath() {
+  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+
+  // Match FreeQwenApi: prefer Puppeteer's bundled "Google Chrome for Testing"
+  // instead of the user's normal /Applications/Google Chrome.app.
+  for (const base of [repoRoot, qwenRepoRoot]) {
+    try {
+      const puppeteerPath = require.resolve('puppeteer', { paths: [base] });
+      const puppeteer = require(puppeteerPath);
+      if (typeof puppeteer.executablePath === 'function') {
+        const p = puppeteer.executablePath();
+        if (p && fs.existsSync(p)) return p;
+      }
+    } catch {}
+  }
+
+  const cacheRoot = path.join(process.env.HOME || '', '.cache', 'puppeteer', 'chrome');
+  try {
+    const candidates = fs.readdirSync(cacheRoot)
+      .map(dir => path.join(cacheRoot, dir, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'))
+      .filter(p => fs.existsSync(p))
+      .sort()
+      .reverse();
+    if (candidates[0]) return candidates[0];
+  } catch {}
+
+  return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+}
+
+const chromePath = resolveChromePath();
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function ask(q) {
@@ -141,20 +219,35 @@ async function readPageAuth(cdp) {
   return { token, cookie, hif_dliq, hif_leim, wasmUrl, baseUrl: 'https://chat.deepseek.com', href: pageState.href, cookiesCount: cookies.length };
 }
 async function main() {
-  if (!fs.existsSync(chromePath)) throw new Error(`Chrome not found: ${chromePath}. Set CHROME_PATH.`);
+  if (!fs.existsSync(chromePath)) throw new Error(`Chrome/Chrome for Testing not found: ${chromePath}. Set CHROME_PATH.`);
+
+  if (!reuseChrome) {
+    killExistingTestingChrome();
+    if (!keepProfile && fs.existsSync(profileDir)) {
+      removeProfileSafely(profileDir);
+      console.log(`[auth] Removed old Chrome for Testing profile: ${profileDir}`);
+    }
+  }
   fs.mkdirSync(profileDir, { recursive: true });
 
-  if (!(await devtoolsReady())) {
-    console.log(`[auth] Starting separate Chrome profile: ${profileDir}`);
+  if (reuseChrome && await devtoolsReady()) {
+    console.log(`[auth] Reusing Chrome DevTools on port ${port}`);
+  } else {
+    console.log(`[auth] Starting clean Chrome for Testing profile: ${profileDir}`);
+    console.log(`[auth] Browser executable: ${chromePath}`);
     const chrome = spawn(chromePath, [
       `--user-data-dir=${profileDir}`,
       `--remote-debugging-port=${port}`,
+      '--use-mock-keychain',
+      '--password-store=basic',
+      '--disable-sync',
+      '--disable-extensions',
+      '--disable-component-extensions-with-background-pages',
+      '--disable-features=AutofillServerCommunication,OptimizationHints,MediaRouter,InterestFeedContentSuggestions,Translate',
       '--no-first-run', '--no-default-browser-check', '--disable-infobars',
       url,
     ], { stdio: 'ignore', detached: true });
     chrome.unref();
-  } else {
-    console.log(`[auth] Reusing Chrome DevTools on port ${port}`);
   }
 
   await waitDevtools();
