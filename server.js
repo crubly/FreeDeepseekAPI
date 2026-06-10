@@ -544,7 +544,12 @@ function coerceToolCallObject(obj) {
     return { name, arguments: JSON.stringify(args) };
 }
 
-function parseJsonToolCandidate(raw, label = 'json') {
+function looksLikeToolJson(raw) {
+    if (!raw || typeof raw !== 'string') return false;
+    return /"tool_call"\s*:|"function_call"\s*:|"arguments"\s*:|"input"\s*:|"name"\s*:|^\s*\{\s*[\w"-]/i.test(raw);
+}
+
+function parseJsonToolCandidate(raw, label = 'json', { logFailures = true } = {}) {
     if (!raw) return null;
     try {
         const parsed = JSON.parse(raw);
@@ -554,7 +559,9 @@ function parseJsonToolCandidate(raw, label = 'json') {
             return tc;
         }
     } catch (e) {
-        console.log(`[parseToolCall] ${label} JSON.parse failed: ${e.message.substring(0, 100)}`);
+        if (logFailures) {
+            console.log(`[parseToolCall] ${label} JSON.parse failed: ${e.message.substring(0, 100)}`);
+        }
     }
     return null;
 }
@@ -632,6 +639,41 @@ function summarizeForLog(value) {
     return String(value || '').replace(/\s+/g, ' ').slice(0, 80);
 }
 
+function parseKeyValueToolCall(text, tools = []) {
+    if (!text || typeof text !== 'string') return null;
+    const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+    const header = lines[0] && lines[0].match(/^tool\s*call\s*:\s*([\w-]+)\s*$/i);
+    if (!header) return null;
+
+    const toolName = header[1];
+    const tool = (tools || []).find(t => t?.type === 'function' && t.function?.name && String(t.function.name).toLowerCase() === toolName.toLowerCase());
+    if (!tool?.function) return null;
+
+    const props = tool.function.parameters?.properties || {};
+    const args = {};
+    for (const line of lines.slice(1)) {
+        const match = line.match(/^([\w-]+)\s*:\s*(.+)$/);
+        if (!match) continue;
+        const rawKey = match[1];
+        const value = match[2].trim();
+        const key = Object.keys(props).find(k => k.toLowerCase() === rawKey.toLowerCase()) || rawKey;
+        if (!(key in props)) continue;
+        const schema = props[key] || {};
+        if (schema.type === 'integer' || schema.type === 'number') {
+            const num = Number(value);
+            args[key] = Number.isFinite(num) ? num : value;
+        } else if (schema.type === 'boolean') {
+            args[key] = /^(true|1|yes|on)$/i.test(value);
+        } else {
+            args[key] = value;
+        }
+    }
+
+    if (Object.keys(args).length === 0) return null;
+    console.log(`[parseToolCall] SUCCESS kv: ${tool.function.name} (args=${JSON.stringify(args).length} chars)`);
+    return { name: tool.function.name, arguments: JSON.stringify(args) };
+}
+
 function isBlank(value) {
     return !value || !String(value).trim();
 }
@@ -652,10 +694,14 @@ function parseToolCall(text, tools = []) {
     }
 
     // Fenced JSON blocks.
-    const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
+    const fenceRe = /```([a-zA-Z0-9_-]*)[ \t]*\n([\s\S]*?)```/g;
     let fence;
     while ((fence = fenceRe.exec(text)) !== null) {
-        const tc = parseJsonToolCandidate(fence[1].trim(), 'fenced');
+        const lang = (fence[1] || '').trim().toLowerCase();
+        if (lang && lang !== 'json') continue;
+        const raw = fence[2].trim();
+        if (!looksLikeToolJson(raw)) continue;
+        const tc = parseJsonToolCandidate(raw, 'fenced', { logFailures: lang === 'json' });
         if (tc) return tc;
     }
 
@@ -683,13 +729,17 @@ function parseToolCall(text, tools = []) {
         }
     }
 
+    const kvToolCall = parseKeyValueToolCall(text, tools);
+    if (kvToolCall) return kvToolCall;
+
     // First balanced JSON object in the whole response. Supports:
     // {"tool_call":{"name":"...","arguments":{...}}}, {"name":"...","arguments":{...}}, etc.
     for (let i = 0; i < text.length; i++) {
         if (text[i] !== '{') continue;
         const rawJson = extractBalancedJsonAt(text, i);
         if (!rawJson) continue;
-        const tc = parseJsonToolCandidate(rawJson, 'inline');
+        if (!looksLikeToolJson(rawJson)) continue;
+        const tc = parseJsonToolCandidate(rawJson, 'inline', { logFailures: false });
         if (tc) return tc;
     }
 
